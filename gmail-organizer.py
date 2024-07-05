@@ -2,6 +2,7 @@ import os
 import json
 import re
 import time
+import argparse
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
@@ -9,7 +10,7 @@ from googleapiclient.discovery import build
 import base64
 from datetime import datetime, timedelta
 
-VERSION = '1.0'
+VERSION = '1.1'
 SCOPES = ['https://www.googleapis.com/auth/gmail.modify']
 
 def get_gmail_service():
@@ -29,7 +30,7 @@ def get_gmail_service():
     return build('gmail', 'v1', credentials=creds)
 
 def get_messages_with_label(service, label):
-    results = service.users().messages().list(userId='me', labelIds=[label]).execute()
+    results = service.users().messages().list(userId='me', labelIds=[label], maxResults=500).execute()
     return results.get('messages', [])
 
 def get_message_date(service, message_id):
@@ -54,27 +55,80 @@ def get_message_date(service, message_id):
 def is_within_date_range(message_date, start_date, end_date):
     return start_date <= message_date <= end_date
 
-def save_attachments(service, message_id, save_dir):
+def get_message_datestr(message, dateformat='%Y%m%d'):
+    """
+    從 Gmail 訊息中提取日期並將其格式化為指定的字串格式。
+
+    :param message: Gmail 訊息對象
+    :param dateformat: 日期字串格式，預設為 'yyyymmdd'
+    :return: 格式化的日期字串，或 None 如果沒有找到日期
+    """
+    headers = message['payload']['headers']
+    date_str = None
+
+    for header in headers:
+        if header['name'] == 'Date':
+            date_str = header['value']
+            break
+
+    if date_str:
+        # 將日期字串解析為 datetime 對象
+        date_obj = datetime.strptime(date_str, '%a, %d %b %Y %H:%M:%S %z')
+        # 轉換為所需的格式
+        formatted_date = date_obj.strftime(dateformat)
+        return formatted_date
+    else:
+        return None
+    
+def sanitize_filename(filename):
+    """
+    移除檔名中的非法字元
+    """
+    return re.sub(r'[\/:*?"<>|]', '', filename)
+
+def save_mail_attachments(service, message_id, save_dir, save_mail=False, save_attachment=True):
     message = service.users().messages().get(userId='me', id=message_id).execute()
-    for part in message['payload'].get('parts', []):
-        if part.get('filename'):
-            if 'data' in part['body']:
-                data = part['body']['data']
-            else:
-                att_id = part['body']['attachmentId']
-                att = service.users().messages().attachments().get(userId='me', messageId=message_id, id=att_id).execute()
-                data = att['data']
-            file_data = base64.urlsafe_b64decode(data.encode('UTF-8'))
-            
-            file_path = os.path.join(save_dir, part['filename'])
-            with open(file_path, 'wb') as f:
-                f.write(file_data)
+    mail_datestr = get_message_datestr(message) or ""
+
+    if save_mail:
+        # 使用 'metadata' 格式取得訊息標題
+        message_metadata = service.users().messages().get(userId='me', id=message_id, format='metadata', metadataHeaders=['Subject']).execute()
+        headers = message_metadata['payload']['headers']
+        subject = next(header['value'] for header in headers if header['name'] == 'Subject')
+        # 將 raw 資料進行 base64 解碼
+
+        # 使用 'raw' 格式取得訊息
+        message_raw = service.users().messages().get(userId='me', id=message_id, format='raw').execute()
+        # 檢查 'raw' 鍵是否存在
+        if 'raw' not in message_raw:
+            raise KeyError("'raw' key not found in the message")
+        # 解碼 raw 資料
+        raw_data = base64.urlsafe_b64decode(message_raw['raw'].encode('UTF-8'))
+        # 將解碼後的資料寫入 .eml 檔案
+        file_path = os.path.join(save_dir, f'{mail_datestr}_{sanitize_filename(subject)}.eml')
+        with open(file_path, 'wb') as eml_file:
+            eml_file.write(raw_data)
+    
+    if save_attachment:
+        for part in message['payload'].get('parts', []):
+            if part.get('filename'):
+                if 'data' in part['body']:
+                    data = part['body']['data']
+                else:
+                    att_id = part['body']['attachmentId']
+                    att = service.users().messages().attachments().get(userId='me', messageId=message_id, id=att_id).execute()
+                    data = att['data']
+                file_data = base64.urlsafe_b64decode(data.encode('UTF-8'))
+                
+                file_path = os.path.join(save_dir, f'{mail_datestr}_{part['filename']}')
+                with open(file_path, 'wb') as f:
+                    f.write(file_data)
 
 def delete_message(service, message_id):
     service.users().messages().trash(userId='me', id=message_id).execute()
 
-def load_config():
-    if not os.path.exists('config.json'):
+def load_config(cfg_file='config.json'):
+    if not os.path.exists(cfg_file):
         config = {
             "label": {
                 "value": "需要處理",
@@ -84,8 +138,16 @@ def load_config():
                 "value": True,
                 "comment": "是否在每次運行時要求確認"
             },
-            "download_attachments": {
+            "download_mail_attachments": {
                 "enabled": {
+                    "value": True,
+                    "comment": "是否啟用"
+                },
+                "save_mail": {
+                    "value": False,
+                    "comment": "是否保存信件檔案(.eml)"
+                },
+                "save_attachment": {
                     "value": True,
                     "comment": "是否下載附件"
                 },
@@ -121,11 +183,11 @@ def load_config():
                 }
             }
         }
-        with open('config.json', 'w', encoding='utf-8') as f:
+        with open(cfg_file, 'w', encoding='utf-8') as f:
             json.dump(config, f, ensure_ascii=False, indent=4)
-        print("已創建默認配置文件 config.json，請根據需要修改它。")
+        print(f"已創建默認配置文件 {cfg_file}，請根據需要修改它。")
     
-    with open('config.json', 'r', encoding='utf-8') as f:
+    with open(cfg_file, 'r', encoding='utf-8') as f:
         return json.load(f)
 
 def parse_date(date_str):
@@ -140,7 +202,7 @@ def get_label_id(service, label_name):
     return None
 
 def get_messages_with_label(service, label_id):
-    results = service.users().messages().list(userId='me', labelIds=[label_id]).execute()
+    results = service.users().messages().list(userId='me', labelIds=[label_id], maxResults=500).execute()
     return results.get('messages', [])
 
 def display_progress(current, total, start_time):
@@ -154,8 +216,8 @@ def display_progress(current, total, start_time):
     
     print(f'\r處理進度: [{bar}] {current}/{total} 封郵件 - {progress:.1%} 完成 - 預計剩餘時間: {eta:.0f}秒', end='', flush=True)
 
-def main():
-    config = load_config()
+def main(cfg_file):
+    config = load_config(cfg_file)
     service = get_gmail_service()
 
     label_name = config['label']['value']
@@ -167,9 +229,10 @@ def main():
     messages = get_messages_with_label(service, label_id)
     total_messages = len(messages)
 
-    print(f"找到 {total_messages} 封帶有標籤 '{label_name}' 的郵件。")
+    print(f"找到 {total_messages} 封帶有標籤 '{label_name}' 的郵件。 (gmail系統最多只能取得500封郵件，如果有更多郵件，請多次運行本程序。)")
+    print(f"數量多時，可能需要較長時間處理 ...")
 
-    download_config = config['download_attachments']
+    download_config = config['download_mail_attachments']
     delete_config = config['delete_emails']
 
     download_count = 0
@@ -178,7 +241,12 @@ def main():
     if download_config['enabled']['value']:
         download_start = parse_date(download_config['date_range']['from']['value'])
         download_end = parse_date(download_config['date_range']['to']['value'])
+        save_mail = download_config['save_mail']['value']
+        save_attachment = download_config['save_attachment']['value']
         save_dir = download_config['save_directory']['value']
+        # 如果輸出目錄不存在，則創建它
+        if not os.path.exists(save_dir):
+            os.makedirs(save_dir)
 
     if delete_config['enabled']['value']:
         delete_start = parse_date(delete_config['date_range']['from']['value'])
@@ -218,7 +286,7 @@ def main():
             continue
 
         if download_config['enabled']['value'] and is_within_date_range(message_date, download_start, download_end):
-            save_attachments(service, message['id'], save_dir)
+            save_mail_attachments(service, message['id'], save_dir, save_mail=save_mail, save_attachment=save_attachment)
         
         if delete_config['enabled']['value'] and is_within_date_range(message_date, delete_start, delete_end):
             delete_message(service, message['id'])
@@ -229,4 +297,8 @@ def main():
     print("\n操作完成。")
 
 if __name__ == '__main__':
-    main()
+    parser = argparse.ArgumentParser(description='Process some integers.')
+    parser.add_argument('cfg_file', type=str, help='Path to the configuration file')
+
+    args = parser.parse_args()
+    main(args.cfg_file)

@@ -1,19 +1,27 @@
 {
     "label": {
-        "value": "104履歷",
+        "value": "報表/LVT報表",
         "comment": "要處理的郵件標籤"
     },
     "confirm_each_run": {
         "value": true,
         "comment": "是否在每次運行時要求確認"
     },
-    "download_attachments": {
+    "download_mail_attachments": {
         "enabled": {
             "value": true,
-            "comment": "是否下載附件"
+            "comment": "是否啟用"
         },
+		"save_mail": {
+			"value": true,
+			"comment": "是否保存信件檔案(.eml)"
+		},
+		"save_attachment": {
+			"value": true,
+			"comment": "是否下載附件"
+		},
         "save_directory": {
-            "value": "attachments_104履歷",
+            "value": "attachments_LVT報表",
             "comment": "保存附件的目錄"
         },
         "date_range": {
