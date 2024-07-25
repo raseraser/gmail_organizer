@@ -1,6 +1,6 @@
 {
     "label": {
-        "value": "報表/LVT報表",
+        "value": "#對帳單/元大證券電子月對帳單",
         "comment": "要處理的郵件標籤"
     },
     "confirm_each_run": {
@@ -13,31 +13,39 @@
             "comment": "是否啟用"
         },
 		"save_mail": {
-			"value": true,
+			"value": false,
 			"comment": "是否保存信件檔案(.eml)"
 		},
 		"save_attachment": {
 			"value": true,
 			"comment": "是否下載附件"
 		},
+		"save_attachment_filename_pattern": {
+		  "value": "%subject%_%attachment_filename%",
+		  "comment": "附件檔名格式：可用變數 %serial%, %attachment_filename%, %subject%, %datetime%"
+		},
+		"file_types": {
+			"value": [".pdf", ".xlsx", ".docx"],
+			"comment": "要下載的文件類型列表"
+		},
         "save_directory": {
-            "value": "attachments_LVT報表",
+            "value": "attachments_元大證券電子月對帳單3",
             "comment": "保存附件的目錄"
         },
         "date_range": {
             "from": {
-                "value": "1980-01-01",
+                "value": "2002-01-01",
                 "comment": "下載附件的開始日期 (YYYY-MM-DD)"
             },
             "to": {
-                "value": "2024-12-31",
+                "value": "2025-01-01",
                 "comment": "下載附件的結束日期 (YYYY-MM-DD)"
             }
         }
     },
     "delete_emails": {
         "enabled": {
-            "value": true,
+            "value": false,
             "comment": "是否刪除郵件"
         },
         "date_range": {
