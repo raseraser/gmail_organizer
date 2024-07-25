@@ -8,9 +8,13 @@ from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
 import base64
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
+import PyPDF2
+import binascii
+import quopri
+import io
 
-VERSION = '1.1'
+VERSION = '1.2'
 SCOPES = ['https://www.googleapis.com/auth/gmail.modify']
 
 def get_gmail_service():
@@ -55,7 +59,7 @@ def get_message_date(service, message_id):
 def is_within_date_range(message_date, start_date, end_date):
     return start_date <= message_date <= end_date
 
-def get_message_datestr(message, dateformat='%Y%m%d'):
+def get_message_datestr(message):
     """
     從 Gmail 訊息中提取日期並將其格式化為指定的字串格式。
 
@@ -64,21 +68,26 @@ def get_message_datestr(message, dateformat='%Y%m%d'):
     :return: 格式化的日期字串，或 None 如果沒有找到日期
     """
     headers = message['payload']['headers']
-    date_str = None
+    date_header = next((header for header in headers if header['name'] == 'Date'), None)
+    if date_header:
+        date_str = date_header['value']
+        # 移除可能存在的額外時區信息
+        date_str = re.sub(r'\s*\([A-Z]+\)$', '', date_str)
+        try:
+            # 嘗試解析標準格式
+            date_obj = datetime.strptime(date_str, '%a, %d %b %Y %H:%M:%S %z')
+        except ValueError:
+            try:
+                # 如果失敗，嘗試解析沒有時區信息的格式
+                date_obj = datetime.strptime(date_str, '%a, %d %b %Y %H:%M:%S')
+                # 假設是本地時間，將其轉換為 UTC
+                date_obj = date_obj.replace(tzinfo=timezone.utc)
+            except ValueError:
+                # 如果還是失敗，返回 None 或者原始字符串
+                return date_str
+        return date_obj.strftime('%Y%m%d_%H%M%S')
+    return None
 
-    for header in headers:
-        if header['name'] == 'Date':
-            date_str = header['value']
-            break
-
-    if date_str:
-        # 將日期字串解析為 datetime 對象
-        date_obj = datetime.strptime(date_str, '%a, %d %b %Y %H:%M:%S %z')
-        # 轉換為所需的格式
-        formatted_date = date_obj.strftime(dateformat)
-        return formatted_date
-    else:
-        return None
     
 def sanitize_filename(filename):
     """
@@ -86,43 +95,157 @@ def sanitize_filename(filename):
     """
     return re.sub(r'[\/:*?"<>|]', '', filename)
 
-def save_mail_attachments(service, message_id, save_dir, save_mail=False, save_attachment=True):
-    message = service.users().messages().get(userId='me', id=message_id).execute()
-    mail_datestr = get_message_datestr(message) or ""
+def save_mail_as_eml(service, msg_id, save_dir, mail_datestr):
+    try:
+        message = service.users().messages().get(userId='me', id=msg_id, format='raw').execute()
+        msg_str = base64.urlsafe_b64decode(message['raw'].encode('ASCII'))
+        mime_msg = email.message_from_bytes(msg_str)
 
-    if save_mail:
-        # 使用 'metadata' 格式取得訊息標題
-        message_metadata = service.users().messages().get(userId='me', id=message_id, format='metadata', metadataHeaders=['Subject']).execute()
-        headers = message_metadata['payload']['headers']
-        subject = next(header['value'] for header in headers if header['name'] == 'Subject')
-        # 將 raw 資料進行 base64 解碼
+        # 使用日期字符串作為文件名前缀
+        filename = f"{mail_datestr}_email.eml"
+        filepath = os.path.join(save_dir, filename)
 
-        # 使用 'raw' 格式取得訊息
-        message_raw = service.users().messages().get(userId='me', id=message_id, format='raw').execute()
-        # 檢查 'raw' 鍵是否存在
-        if 'raw' not in message_raw:
-            raise KeyError("'raw' key not found in the message")
-        # 解碼 raw 資料
-        raw_data = base64.urlsafe_b64decode(message_raw['raw'].encode('UTF-8'))
-        # 將解碼後的資料寫入 .eml 檔案
-        file_path = os.path.join(save_dir, f'{mail_datestr}_{sanitize_filename(subject)}.eml')
-        with open(file_path, 'wb') as eml_file:
-            eml_file.write(raw_data)
+        with open(filepath, 'wb') as f:
+            f.write(msg_str)
+        print(f"已保存郵件: {filepath}")
+    except Exception as error:
+        print(f'保存郵件為 .eml 文件時發生錯誤: {error}')
+
+def save_mail_attachments(service, msg_id, save_dir, file_types=None, save_mail=False, save_attachment=True):
+    try:
+        message = service.users().messages().get(userId='me', id=msg_id, format='full').execute()
+        mail_datestr = get_message_datestr(message) or ""
+
+        print(f"處理郵件 ID: {msg_id}")
+        print(f"郵件日期: {mail_datestr}")
+
+        if save_mail:
+            save_mail_as_eml(service, msg_id, save_dir, mail_datestr)
+
+        if save_attachment:
+            process_parts(service, msg_id, message['payload'], save_dir, mail_datestr, file_types)
+
+    except Exception as error:
+        print(f'處理郵件附件時發生錯誤: {error}')
+
+def process_parts(service, msg_id, part, save_dir, mail_datestr, file_types, level=0):
+    print("  " * level + f"處理部分 MIME 類型: {part.get('mimeType', 'Unknown')}")
+
+    if 'parts' in part:
+        for sub_part in part['parts']:
+            process_parts(service, msg_id, sub_part, save_dir, mail_datestr, file_types, level + 1)
+    elif part.get('mimeType') == 'application/octet-stream':
+        print("  " * level + "檢測到 application/octet-stream，調用 handle_octet_stream...")
+        handle_octet_stream(service, msg_id, part, save_dir, mail_datestr, file_types)
+    elif 'filename' in part.get('body', {}):
+        filename = part['body']['filename']
+        print("  " * level + f"檢測到文件名: {filename}")
+        # 處理其他類型的附件...
+    else:
+        print("  " * level + "未知部分類型，跳過")
+
+def handle_octet_stream(service, msg_id, part, save_dir, mail_datestr, file_types):
+    print("開始處理 octet-stream...")
+    if 'data' in part['body']:
+        data = part['body']['data']
+    else:
+        att_id = part['body']['attachmentId']
+        print(f"使用 attachmentId: {att_id}")
+        att = service.users().messages().attachments().get(userId='me', messageId=msg_id, id=att_id).execute()
+        data = att['data']
     
-    if save_attachment:
-        for part in message['payload'].get('parts', []):
-            if part.get('filename'):
-                if 'data' in part['body']:
-                    data = part['body']['data']
-                else:
-                    att_id = part['body']['attachmentId']
-                    att = service.users().messages().attachments().get(userId='me', messageId=message_id, id=att_id).execute()
-                    data = att['data']
-                file_data = base64.urlsafe_b64decode(data.encode('UTF-8'))
+    file_data = base64.urlsafe_b64decode(data.encode('UTF-8'))
+    
+    print(f"數據大小: {len(file_data)} 字節")
+    print(f"前100個字節: {binascii.hexlify(file_data[:100])}")
+    
+    # 保存原始數據以供進一步分析
+    raw_filename = f"{mail_datestr}_raw_data.bin"
+    raw_filepath = os.path.join(save_dir, raw_filename)
+    with open(raw_filepath, 'wb') as f:
+        f.write(file_data)
+    print(f"已保存原始數據: {raw_filepath}")
+
+    # 檢查是否為 PDF 文件
+    if file_data[:4] == b'%PDF':
+        print("檢測到 PDF 文件")
+        pdf_filename = f"{mail_datestr}_document.pdf"
+        pdf_filepath = os.path.join(save_dir, pdf_filename)
+        with open(pdf_filepath, 'wb') as f:
+            f.write(file_data)
+        print(f"已保存 PDF 文件: {pdf_filepath}")
+        return
+
+    # 如果不是 PDF，嘗試其他方法
+    try:
+        print("嘗試作為 email 附件解析...")
+        decoded_content = quopri.decodestring(file_data)
+        msg = email.message_from_bytes(decoded_content)
+        
+        for attachment in msg.walk():
+            print(f"附件類型: {attachment.get_content_type()}")
+            if attachment.get_content_maintype() == 'application' and attachment.get_filename():
+                filename = attachment.get_filename()
+                print(f"在 octet-stream 中找到附件: {filename}")
                 
-                file_path = os.path.join(save_dir, f'{mail_datestr}_{part['filename']}')
-                with open(file_path, 'wb') as f:
-                    f.write(file_data)
+                file_extension = os.path.splitext(filename)[1].lower()
+                if file_types is None or file_extension in file_types:
+                    attachment_data = attachment.get_payload(decode=True)
+                    save_file(attachment_data, filename, save_dir, mail_datestr)
+                else:
+                    print(f"跳過不符合類型的附件: {filename}")
+    except Exception as e:
+        print(f"以 email 附件方式解析失敗: {str(e)}")
+    
+    # 如果上述方法都失敗，保存為未知二進制文件
+    print("保存為未知二進制文件...")
+    unknown_filename = f"{mail_datestr}_unknown_content.bin"
+    unknown_filepath = os.path.join(save_dir, unknown_filename)
+    with open(unknown_filepath, 'wb') as f:
+        f.write(file_data)
+    print(f"已保存未知內容: {unknown_filepath}")
+
+def save_file(data, filename, save_dir, mail_datestr):
+    filepath = os.path.join(save_dir, filename)
+    with open(filepath, 'wb') as f:
+        f.write(data)
+    print(f"已保存文件: {filepath}")
+
+def print_message_structure(part, level=0):
+    print('  ' * level + f"MIME Type: {part.get('mimeType', 'Unknown')}")
+    if 'filename' in part.get('body', {}):
+        print('  ' * level + f"Filename: {part['body'].get('filename', 'Unknown')}")
+    if 'parts' in part:
+        for sub_part in part['parts']:
+            print_message_structure(sub_part, level + 1)
+    # 添加更多細節
+    if part.get('mimeType') == 'application/octet-stream':
+        print('  ' * (level+1) + "Octet-stream details:")
+        print('  ' * (level+2) + f"Size: {part['body'].get('size', 'Unknown')} bytes")
+        print('  ' * (level+2) + f"AttachmentId: {part['body'].get('attachmentId', 'Not present')}")
+
+def save_attachment(service, msg_id, part, save_dir, mail_datestr, file_types):
+    filename = part['body']['filename']
+    print(f"正在處理附件: {filename} ...")
+    file_extension = os.path.splitext(filename)[1].lower()
+    
+    if file_types is None or file_extension in file_types:
+        if 'data' in part['body']:
+            data = part['body']['data']
+        else:
+            att_id = part['body']['attachmentId']
+            att = service.users().messages().attachments().get(userId='me', messageId=msg_id, id=att_id).execute()
+            data = att['data']
+        file_data = base64.urlsafe_b64decode(data.encode('UTF-8'))
+        
+        full_filename = f"{mail_datestr}_{filename}"
+        filepath = os.path.join(save_dir, full_filename)
+        
+        with open(filepath, 'wb') as f:
+            f.write(file_data)
+        print(f"已保存附件: {filepath}")
+    else:
+        print(f"跳過不符合類型的附件: {filename}")
 
 def delete_message(service, message_id):
     service.users().messages().trash(userId='me', id=message_id).execute()
@@ -150,6 +273,10 @@ def load_config(cfg_file='config.json'):
                 "save_attachment": {
                     "value": True,
                     "comment": "是否下載附件"
+                },
+                "file_types": {
+                    "value": [".pdf", ".xlsx", ".docx"],
+                    "comment": "要下載的文件類型列表"
                 },
                 "save_directory": {
                     "value": "attachments",
@@ -281,13 +408,22 @@ def main(cfg_file):
     processed_count = 0
 
     for message in messages:
+        print(f"\n處理郵件: {message['id']}")
+        print(f"郵件摘要: {message.get('snippet', 'No snippet available')[:100]}...")
+
         message_date = get_message_date(service, message['id'])
         if message_date is None:
             continue
 
         if download_config['enabled']['value'] and is_within_date_range(message_date, download_start, download_end):
-            save_mail_attachments(service, message['id'], save_dir, save_mail=save_mail, save_attachment=save_attachment)
-        
+            save_mail_attachments(
+                service, 
+                message['id'], 
+                save_dir, 
+                file_types=download_config['file_types']['value'] if 'file_types' in download_config else None,
+                save_mail=download_config['save_mail']['value'],
+                save_attachment=download_config['save_attachment']['value']
+            )
         if delete_config['enabled']['value'] and is_within_date_range(message_date, delete_start, delete_end):
             delete_message(service, message['id'])
         
