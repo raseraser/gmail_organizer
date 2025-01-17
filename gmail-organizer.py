@@ -14,7 +14,7 @@ import binascii
 import quopri
 import io
 
-VERSION = '1.2'
+VERSION = '1.3'
 SCOPES = ['https://www.googleapis.com/auth/gmail.modify']
 
 def get_gmail_service():
@@ -189,6 +189,73 @@ def save_mail_as_eml(service, msg_id, save_dir, mail_datestr):
     with open(filepath, 'wb') as f:
         f.write(msg_str)
     #print(f"已保存郵件: {filepath}")
+    if save_mail:
+        # 使用 'metadata' 格式取得訊息標題
+        message_metadata = service.users().messages().get(userId='me', id=message_id, format='metadata', metadataHeaders=['Subject']).execute()
+        headers = message_metadata['payload']['headers']
+        subject = next(header['value'] for header in headers if header['name'] == 'Subject')
+
+        message_raw = service.users().messages().get(userId='me', id=message_id, format='raw').execute()
+        if 'raw' not in message_raw:
+            raise KeyError("'raw' key not found in the message")
+        raw_data = base64.urlsafe_b64decode(message_raw['raw'].encode('UTF-8'))
+        file_path = os.path.join(save_dir, f'{mail_datestr}_{sanitize_filename(subject)}.eml')
+        with open(file_path, 'wb') as eml_file:
+            eml_file.write(raw_data)
+    
+    def process_parts(parts):
+        """遞迴處理郵件部分"""
+        for part in parts:
+            # 檢查是否有子部分（處理多層結構）
+            if 'parts' in part:
+                process_parts(part['parts'])
+                continue
+
+            # 只有在需要保存附件時才處理
+            if not save_attachment or not part.get('filename'):
+                continue
+
+            # 跳過 S/MIME 簽名檔
+            if part['filename'].lower().endswith('.p7s'):
+                continue
+
+            try:
+                if 'data' in part['body']:
+                    data = part['body']['data']
+                else:
+                    att_id = part['body']['attachmentId']
+                    att = service.users().messages().attachments().get(
+                        userId='me', 
+                        messageId=message_id, 
+                        id=att_id
+                    ).execute()
+                    data = att['data']
+                
+                file_data = base64.urlsafe_b64decode(data.encode('UTF-8'))
+                
+                # 確保檔名是唯一的
+                base_filename = f"{mail_datestr}_{part['filename']}"
+                file_path = os.path.join(save_dir, base_filename)
+                counter = 1
+                
+                # 如果檔案已存在，加上編號
+                while os.path.exists(file_path):
+                    name, ext = os.path.splitext(base_filename)
+                    file_path = os.path.join(save_dir, f"{name}_{counter}{ext}")
+                    counter += 1
+
+                with open(file_path, 'wb') as f:
+                    f.write(file_data)
+            except Exception as e:
+                print(f"警告：處理附件 '{part.get('filename', '未知')}' 時發生錯誤: {str(e)}")
+                continue
+
+    # 處理主要內容
+    if 'parts' in message['payload']:
+        process_parts(message['payload']['parts'])
+    # 處理沒有 parts 的情況
+    elif message['payload'].get('filename') and save_attachment:
+        process_parts([message['payload']])
 
 def delete_message(service, message_id):
     service.users().messages().trash(userId='me', id=message_id).execute()
@@ -287,6 +354,7 @@ def display_progress(current, total, start_time):
     print(f'\r處理進度: [{bar}] {current}/{total} 封郵件 - {progress:.1%} 完成 - 預計剩餘時間: {eta:.0f}秒', end='', flush=True)
 
 def main(cfg_file):
+    print(f"Gmail Organizer v{VERSION}")
     config = load_config(cfg_file)
     service = get_gmail_service()
 
@@ -299,11 +367,12 @@ def main(cfg_file):
     messages = get_messages_with_label(service, label_id)
     total_messages = len(messages)
 
-    print(f"找到 {total_messages} 封帶有標籤 '{label_name}' 的郵件。 (gmail系統最多只能取得500封郵件，如果有更多郵件，請多次運行本程序。)")
-    print(f"數量多時，可能需要較長時間處理 ...")
-
     download_config = config['download_mail_attachments']
     delete_config = config['delete_emails']
+
+    print(f"找到 {total_messages} 封帶有標籤 '{label_name}' 的郵件。 (gmail系統最多只能取得500封郵件，如果有更多郵件，請多次運行本程序。)")
+    print(f"數量多時，可能需要較長時間處理 ...")
+    print(f"是否刪除郵件({delete_config['date_range']['from']['value']}~{delete_config['date_range']['to']['value']})? {delete_config['enabled']['value']}")
 
     download_count = 0
     delete_count = 0

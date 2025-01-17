@@ -1,6 +1,6 @@
 {
     "label": {
-        "value": "#對帳單/元大證券電子月對帳單",
+        "value": "理財/集保eNotice",
         "comment": "要處理的郵件標籤"
     },
     "confirm_each_run": {
@@ -29,7 +29,7 @@
 			"comment": "要下載的文件類型列表"
 		},
         "save_directory": {
-            "value": "attachments_元大證券電子月對帳單3",
+             "value": "attachments_集保enotice",
             "comment": "保存附件的目錄"
         },
         "date_range": {
@@ -50,11 +50,11 @@
         },
         "date_range": {
             "from": {
-                "value": "1980-07-01",
+                "value": "1980-01-01",
                 "comment": "開始日期 (YYYY-MM-DD)"
             },
             "to": {
-                "value": "2024-01-01",
+                "value": "2030-12-31",
                 "comment": "結束日期 (YYYY-MM-DD)"
             }
         }
